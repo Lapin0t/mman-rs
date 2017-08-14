@@ -1,0 +1,7 @@
+[package]
+name = "mman"
+version = "0.1.0"
+authors = [ "peio <peio.borthelle@ens-lyon.fr>" ]
+
+[dependencies]
+libc = "0.2"
