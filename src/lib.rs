@@ -18,22 +18,25 @@ use std::io;
 
 /// Representation of an arbitrary memory region.
 ///
-/// This can safely point to invalid memory, it does not provide any access
-/// (even read-only) and is merely a placeholder to support memory management
-/// operation. These operations will just fail with an ENOMEM (invalid address
-/// range).
+/// This can safely point to invalid or mutable memory, it does not provide any
+/// access (even read-only) and is merely a placeholder to support memory
+/// management operation. These operations will just fail with an ENOMEM
+/// (invalid address range).
+///
+/// The region will be expanded on both sides to be aligned to page boundaries.
 pub struct MemoryView {
     ptr: *const u8,
     len: usize,
-    pad: usize,
 }
 
 
 impl<'a, T: 'a + ?Sized> From<&'a T> for MemoryView {
-    fn from(val: &'a T) -> MemoryView {
-        MemoryView::from_raw_parts(
-            unsafe { mem::transmute_copy(&val) },
-            mem::size_of_val(val),
+    /// Get a memory view spanning all pages that overlap with the object
+    /// pointed to by `value`.
+    fn from(value: &'a T) -> MemoryView {
+        MemoryView::new(
+            value as *const T as *const u8,
+            mem::size_of_val(value),
         )
     }
 }
@@ -41,8 +44,10 @@ impl<'a, T: 'a + ?Sized> From<&'a T> for MemoryView {
 
 impl MemoryView {
     /// Construct a memory view from a pointer and a length. This is safe
-    /// because the pointer will never be used to read or write the memory.
-    pub fn from_raw_parts(ptr: *const u8, len: usize) -> Self {
+    /// because the pointer will never be dereferenced. The memory view will
+    /// grow to snap to memory page boundaries as all provided method have page
+    /// level resolution.
+    pub fn new(ptr: *const u8, len: usize) -> Self {
         let pgs = page_size();
         let pad = ptr as usize & (pgs - 1);
         MemoryView {
@@ -50,7 +55,19 @@ impl MemoryView {
             len: (len + pad + pgs - 1) & -pgs,
         }
     }
-    
+
+    /// Construct a memory view from pointer and length.
+    ///
+    /// # Safety
+    ///
+    /// The pointer and length can safely point to invalid memory, but this
+    /// method will not verify that it is aligned to page boundaries so it
+    /// may trigger UB on some systems when calling libc memory managment
+    /// functions.
+    pub unsafe fn new_unaligned(ptr: *const u8, len: usize) -> Self {
+        MemoryView { ptr, len }
+    }
+
     /// Length of the memory region.
     pub fn len(&self) -> usize {
         self.len
@@ -74,8 +91,8 @@ impl MemoryView {
     pub fn lock(&self) -> io::Result<()> {
         unsafe {
             check(libc::mlock(
-                self.ptr.offset(-(self.pad as isize)) as *const libc::c_void,
-                (self.len + self.pad) as libc::size_t))
+                self.ptr as *const libc::c_void,
+                self.len as libc::size_t))
         }
     }
 
@@ -88,8 +105,8 @@ impl MemoryView {
     pub fn unlock(&self) -> io::Result<()> {
         unsafe {
             check(libc::munlock(
-                self.ptr.offset(-(self.pad as isize)) as *const libc::c_void,
-                (self.len + self.pad) as libc::size_t))
+                self.ptr as *const libc::c_void,
+                self.len as libc::size_t))
         }
     }
 
@@ -100,14 +117,12 @@ impl MemoryView {
     ///
     /// [mincore(2)]: http://man7.org/linux/man-pages/man2/mincore.2.html
     pub fn is_resident(&self) -> io::Result<Vec<bool>> {
-        let pgs = page_size();
-        let n_pages = (self.len + self.pad + pgs - 1) / pgs;
-        let mut v = vec![0u8; n_pages];
+        let mut v = vec![0u8; self.len / page_size()];
 
         unsafe {
             check(libc::mincore(
-                self.ptr.offset(-(self.pad as isize)) as *mut libc::c_void,
-                (self.len + self.pad) as libc::size_t,
+                self.ptr as *mut libc::c_void,
+                self.len as libc::size_t,
                 v.as_mut_ptr() as *mut libc::c_uchar))?;
         }
 
